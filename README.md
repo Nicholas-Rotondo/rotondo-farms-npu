@@ -4,6 +4,9 @@ An edge AI plant health monitoring system running on the Orange Pi 5 (Rockchip R
 
 **Track:** Physical AI
 
+**Demo video:** https://youtu.be/mhgFhElPhOE
+**Repo:** https://github.com/Nicholas-Rotondo/rotondo-farms-npu
+
 ## Project Overview
 
 Rotondo Farms is a real, physical indoor grow-cabinet monitoring system. Capacitive soil moisture sensors feed live readings into an Orange Pi 5, which runs a locally-hosted, quantized LLM (Qwen3-0.6B) to generate natural-language plant health narrations directly from sensor data — no cloud API calls, fully on-device.
