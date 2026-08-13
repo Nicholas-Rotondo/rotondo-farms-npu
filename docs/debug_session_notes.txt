@@ -1,0 +1,150 @@
+ROTONDO FARMS — NPU NARRATION PIPELINE
+Session summary — August 4, 2026
+
+===========================================
+WHAT WE BUILT
+===========================================
+
+sensor_narration.py — a Python script that:
+- Reads live moisture data from 4 capacitive sensors via ADS1115 on i2c-5 (address 0x48)
+  Plants: Chamomile (A0), Borage (A1), Lavender (A2), Peppermint (A3)
+  Thresholds: dry > 20,000 | ok 15,000-20,000 | wet < 15,000
+- Builds a prompt from the readings
+- Sends it to a local RKLLama server (/api/chat) for a natural-language plant health narration
+- Logs timing + token-count benchmark data to npu_benchmark.csv for the hackathon writeup
+- Supports --loop N for repeated runs (intended cadence: every 4 hours, --loop 14400)
+
+Sensor reading confirmed working correctly and consistently throughout the session.
+Script itself is solid — every bug found tonight was in the RKLLama/RKLLM stack, not the script.
+
+===========================================
+BUGS FOUND AND FIXED TONIGHT
+===========================================
+
+1. Missing Python deps on OPi5 (requests, smbus2)
+   Fix: pip install inside the rkllama-env venv.
+
+2. RKLLama Ollama-API dependency: missing `requests` — resolved.
+
+3. Qwen3 "thinking mode" chat template mishandling on the GGUF/llama.cpp path
+   Symptom: garbled leading punctuation, generation dying after ~7-17 tokens,
+   regardless of num_predict / max token settings.
+   Root cause: the .gguf model was loose in ~/models with no config.ini, so there was
+   no way to disable Qwen3's default reasoning ("thinking") mode at the server level.
+   Fix: restructured into ~/models/qwen3-0.6b/ with a config.ini setting
+   chat-template-kwargs = {"enable_thinking": false}. This fixed the CPU/GGUF path
+   completely — full, coherent narrations, e.g.:
+     "Based on the sensor readings, the grow cabinet is in a healthy state.
+      Chamomile shows some dryness, but it's still relatively moist..."
+   Benchmark at this point: 17.04 tok/s — BUT this number was later proven to be
+   running on CPU, not NPU (see below).
+
+4. GGUF-on-NPU never actually engaged the NPU
+   Checked via: cat /sys/kernel/debug/rknpu/load — stayed at 0% during generation.
+   Root cause: missing RKNPU_HYBRID env var in config.ini. Added it, still 0% load.
+   Conclusion: RKLLama's own docs mark GGUF-on-NPU as "EXPERIMENTAL — many bugs can
+   appear." Not worth further time on this path.
+
+===========================================
+CURRENT STATE / WHERE WE STOPPED
+===========================================
+
+Switched to the RECOMMENDED path: native .rkllm models (not GGUF), pulled via
+rkllama_client pull directly from Hugging Face — no need for the rkllm-toolkit
+x86-Linux conversion step, since pre-converted models already exist:
+
+  - dulimov/Qwen3-0.6B-rk3588-1.2.1-unsloth
+    File: Qwen3-0.6B-rk3588-w8a8-opt-1-hybrid-ratio-0.0.rkllm  (932MB)
+  - dulimov/Qwen3-1.7B-rk3588-1.2.1-unsloth
+    File: Qwen3-1.7B-rk3588-w8a8-opt-1-hybrid-ratio-0.0.rkllm  (2.26GB)
+
+IMPORTANT GOTCHA: rkllama_client pull saves into ~/rkllama/models by default,
+NOT into the ~/models directory the server was started with (--models ~/models).
+Had to manually `mv` the 1.7B folder over. Worth checking ~/rkllama/models
+for anything else that landed in the wrong place.
+
+Both .rkllm models WORK and DO engage the NPU (confirmed 3-50% NPU load via
+/sys/kernel/debug/rknpu/load — this is real hardware acceleration, unlike the
+GGUF path). This is real progress.
+
+BUT: both models still produce truncated output — cutting off mid-sentence,
+consistently, most often right after a comma. This happened across THREE
+different model files (0.6B GGUF, 0.6B native rkllm, 1.7B native rkllm),
+which rules out a bad single conversion.
+
+Ruled out as causes tonight:
+  - num_predict / max_new_tokens settings (Modelfile has MAX_NEW_TOKENS=1024,
+    truncation happens at ~10-25 tokens, nowhere near that limit)
+  - Sampling params (loosened TOP_K/TOP_P/TEMPERATURE to Qwen's recommended
+    defaults — no change)
+  - Thinking-mode chat template (ENABLE_THINKING=False already set correctly
+    in the auto-generated Modelfile)
+  - Streaming vs non-streaming display bug (tested with /set stream — text
+    genuinely stops generating, it's not a display/buffering issue)
+  - OOM kill (checked dmesg — no OOM-kill entries)
+  - Wrong model directory being read by the server (checked /api/tags —
+    server does see loaded models, though registry reporting has its own
+    separate quirks from the ~/rkllama/models vs ~/models split above)
+
+STRONG LEAD, NOT YET CONFIRMED: found GitHub issue #102 on NotPunchnox/rkllama
+("Garbage when using librkllmrt v1.2.3") describing the EXACT symptom —
+generation breaks down a few tokens in, "usually comes after a comma" — traced
+to the version of librkllmrt.so (the compiled RKLLM runtime library) in use.
+Our server is running RKLLM SDK version 1.3.0 (checked via strings on
+librkllmrt.so), newer than the 1.2.3 in that reported issue. This looks like
+the same family of bug, possibly worse on our version. Where their case showed
+visible garbage character repetition after the comma, ours may be truncating
+cleanly at the same failure point instead of showing garbage — same underlying
+cause, different visible symptom.
+
+===========================================
+NEXT STEPS (tomorrow)
+===========================================
+
+1. Check the rkllama_server startup log output for the model-load lines —
+   look for "rkllm-runtime version" / "model version is too old" / any
+   toolkit-vs-runtime warning text. (Did not get to this before ending
+   tonight's session.)
+
+2. Try downgrading librkllmrt.so to an earlier version (e.g. 1.2.1) per the
+   workaround pattern in issue #102 — swap the .so file RKLLama loads and
+   retest the same "give me 120 words on the sun" prompt.
+
+3. If the runtime swap fixes it: rerun sensor_narration.py end-to-end with
+   the NPU model, confirm both full narrations AND non-zero NPU load, then
+   this is DONE — deploy on the --loop 14400 (4-hour) cadence.
+
+4. If it's still broken after the runtime swap: worth filing/commenting on
+   issue #102 with our findings (0.6B and 1.7B models, RKLLM SDK 1.3.0,
+   Orange Pi 5 4GB, same failure signature) — useful data for the maintainer
+   and potentially for the hackathon writeup as a documented, contributed
+   finding rather than just an unresolved bug.
+
+===========================================
+TO INVESTIGATE LATER (noted, not yet actioned)
+===========================================
+
+- On server startup, localhost/RKLLama may be auto-starting a Qwen model
+  instance on its own, separate from explicit rkllama_client run calls.
+  Not yet confirmed or diagnosed — revisit after work. Possible lead: check
+  RKLLama config for a default/autostart model setting (the "Models Monitor"
+  line seen in server startup logs may be related).
+
+===========================================
+HACKATHON NOTES (Track 1 — Arm Create: AI Optimization Challenge)
+===========================================
+
+Judging: Technological Implementation (40pts), UX/DX (15pts), Potential Impact
+(20pts), "Wow" factor (25pts). Deadline: Aug 14, 2026.
+
+This debugging chain (loose GGUF file -> no config.ini -> silent CPU fallback
+-> switch to native .rkllm -> real NPU engagement -> runtime version bug) is
+a legitimate, non-obvious NPU deployment story. Worth including a condensed
+version in the writeup regardless of how the runtime bug resolves — it
+demonstrates real engineering work on the Technological Implementation
+criterion, not just a working demo.
+
+Benchmark data collected so far (npu_benchmark.csv on the OPi5):
+  - CPU (GGUF path, thinking disabled): 17.04 tok/s, 90 tokens, coherent output
+  - NPU (native .rkllm, 0.6B and 1.7B): NPU load confirmed 3-50%, but output
+    truncated so tok/s numbers from these runs are not yet trustworthy/citable
